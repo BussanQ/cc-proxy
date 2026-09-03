@@ -180,6 +180,7 @@ message AgentRunRequest {
   McpTools mcp_tools = 4;
   optional string conversation_id = 5;
   optional string custom_system_prompt = 8;
+  optional RequestedModel requested_model = 9;
 }
 
 message TextDeltaUpdate { string text = 1; }
@@ -355,6 +356,17 @@ message AgentServerMessage {
     ConversationStateStructure conversation_checkpoint_update = 3;
     KvServerMessage kv_server_message = 4;
   }
+}
+
+message RequestedModel {
+  string model_id = 1;
+  bool max_mode = 2;
+  repeated RequestedModel_ModelParameterbytes parameters = 3;
+}
+
+message RequestedModel_ModelParameterbytes {
+  string id = 1;
+  string value = 2;
 }
 
 service AgentService {

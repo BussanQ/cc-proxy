@@ -9,9 +9,9 @@ import (
 
 func TestBuildCursorCachedModelsThinkingVariants(t *testing.T) {
 	auth := &coreauth.Auth{Metadata: map[string]any{cursorauth.ModelCacheKey: []any{
-		map[string]any{"id": "gpt-test", "display_name": "GPT Test"},
-		map[string]any{"id": "gpt-test-low", "thinking": true},
-		map[string]any{"id": "gpt-test-high", "thinking": true},
+		map[string]any{"id": "cursor-gpt-test", "display_name": "GPT Test"},
+		map[string]any{"id": "cursor-gpt-test-low", "thinking": true},
+		map[string]any{"id": "cursor-gpt-test-high", "thinking": true},
 	}}}
 	models := buildCursorCachedModels(auth)
 	if len(models) != 3 {

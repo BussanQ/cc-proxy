@@ -44,12 +44,47 @@ func TestBuildCursorRunPayloadWithImageAndTools(t *testing.T) {
 	if run.SystemPrompt != "Be concise." {
 		t.Fatalf("system prompt = %q, want %q", run.SystemPrompt, "Be concise.")
 	}
+	if got := runRequest.GetRequestedModel().GetModelId(); got != "gpt-test" {
+		t.Fatalf("requested model = %q, want %q", got, "gpt-test")
+	}
+	if runRequest.GetModelDetails() != nil {
+		t.Fatal("parameterized protocol request unexpectedly included deprecated model_details")
+	}
 	userAction := runRequest.GetAction().GetUserMessageAction()
 	if userAction == nil || len(userAction.GetUserMessage().GetSelectedContext().GetSelectedImages()) != 1 {
 		t.Fatal("current image was not encoded")
 	}
 	if userAction.SendToInteractionListener == nil || !userAction.GetSendToInteractionListener() {
 		t.Fatal("interaction listener streaming was not enabled")
+	}
+}
+
+func TestBuildCursorRunPayloadExpandsGrokVariantParameters(t *testing.T) {
+	raw := []byte(`{"model":"grok-4.6-high-fast","messages":[{"role":"user","content":"hello"}]}`)
+	run, err := BuildCursorRunPayload(raw, "cursor-grok-4.6-high-fast")
+	if err != nil {
+		t.Fatalf("BuildCursorRunPayload() error = %v", err)
+	}
+	var message cursorproto.AgentClientMessage
+	if errDecode := proto.Unmarshal(run.Message, &message); errDecode != nil {
+		t.Fatalf("decode run message: %v", errDecode)
+	}
+	request := message.GetRunRequest()
+	if request.GetModelDetails() != nil {
+		t.Fatal("request unexpectedly included deprecated model_details")
+	}
+	requested := request.GetRequestedModel()
+	if got := requested.GetModelId(); got != "grok-4.6" {
+		t.Fatalf("requested model = %q, want %q", got, "grok-4.6")
+	}
+	want := map[string]string{"effort": "high", "fast": "true"}
+	if len(requested.GetParameters()) != len(want) {
+		t.Fatalf("parameters = %#v", requested.GetParameters())
+	}
+	for _, parameter := range requested.GetParameters() {
+		if want[parameter.GetId()] != parameter.GetValue() {
+			t.Fatalf("parameter %q = %q", parameter.GetId(), parameter.GetValue())
+		}
 	}
 }
 

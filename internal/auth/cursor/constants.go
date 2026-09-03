@@ -8,7 +8,7 @@ const (
 	RunPath        = "/agent.v1.AgentService/Run"
 	ModelsPath     = "/agent.v1.AgentService/GetUsableModels"
 	CLIClientID    = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
-	ClientVersion  = "cli-2026.01.09-231024f"
+	ClientVersion  = "cli-2026.09.02-c22c1a3"
 	ClientType     = "cli"
 	ModelCacheKey  = "models"
 	OAuthKind      = "oauth"

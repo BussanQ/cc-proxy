@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -156,16 +157,13 @@ func BuildCursorRunPayload(payload []byte, modelID string) (*CursorRunPayload, e
 		},
 	}}
 	conversationID := uuid.NewString()
+	requestedModel := buildCursorRequestedModel(modelID)
 	run := &cursorproto.AgentRunRequest{
 		ConversationState: state,
 		Action:            action,
-		ModelDetails: &cursorproto.ModelDetails{
-			ModelId:        modelID,
-			DisplayModelId: modelID,
-			DisplayName:    modelID,
-		},
-		McpTools:       &cursorproto.McpTools{McpTools: tools},
-		ConversationId: proto.String(conversationID),
+		McpTools:          &cursorproto.McpTools{McpTools: tools},
+		ConversationId:    proto.String(conversationID),
+		RequestedModel:    requestedModel,
 	}
 	message, errMarshal := proto.Marshal(&cursorproto.AgentClientMessage{
 		Message: &cursorproto.AgentClientMessage_RunRequest{RunRequest: run},
@@ -180,6 +178,35 @@ func BuildCursorRunPayload(payload []byte, modelID string) (*CursorRunPayload, e
 		SystemPrompt:   parsed.SystemPrompt,
 		ConversationID: conversationID,
 	}, nil
+}
+
+func buildCursorRequestedModel(modelID string) *cursorproto.RequestedModel {
+	requested := &cursorproto.RequestedModel{ModelId: modelID}
+	publicID := strings.TrimPrefix(modelID, "cursor-")
+	for _, base := range []string{"grok-4.6", "grok-4.5"} {
+		if publicID == base {
+			requested.ModelId = base
+			return requested
+		}
+		variant := strings.TrimPrefix(publicID, base+"-")
+		if variant == publicID {
+			continue
+		}
+		fast := strings.HasSuffix(variant, "-fast")
+		if fast {
+			variant = strings.TrimSuffix(variant, "-fast")
+		}
+		switch variant {
+		case "low", "medium", "high", "xhigh", "max":
+			requested.ModelId = base
+			requested.Parameters = []*cursorproto.RequestedModel_ModelParameterbytes{
+				{Id: "effort", Value: variant},
+				{Id: "fast", Value: strconv.FormatBool(fast)},
+			}
+		}
+		return requested
+	}
+	return requested
 }
 
 // buildCursorActionText makes history visible to the model on a stateless Run.

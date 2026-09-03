@@ -44,6 +44,7 @@ type Tokens struct {
 // ModelDetails is the persisted subset of Cursor's dynamic model catalog.
 type ModelDetails struct {
 	ID             string   `json:"id"`
+	UpstreamID     string   `json:"upstream_id,omitempty"`
 	DisplayName    string   `json:"display_name,omitempty"`
 	DisplayModelID string   `json:"display_model_id,omitempty"`
 	Aliases        []string `json:"aliases,omitempty"`
@@ -258,7 +259,8 @@ func (c *Client) DiscoverModels(ctx context.Context, accessToken string) ([]Mode
 		if model == nil {
 			continue
 		}
-		id := strings.TrimSpace(model.ModelId)
+		upstreamID := strings.TrimSpace(model.ModelId)
+		id := NormalizeModelID(upstreamID)
 		if id == "" {
 			continue
 		}
@@ -268,8 +270,9 @@ func (c *Client) DiscoverModels(ctx context.Context, accessToken string) ([]Mode
 		seen[id] = struct{}{}
 		models = append(models, ModelDetails{
 			ID:             id,
+			UpstreamID:     upstreamID,
 			DisplayName:    strings.TrimSpace(model.DisplayName),
-			DisplayModelID: strings.TrimSpace(model.DisplayModelId),
+			DisplayModelID: NormalizeModelID(model.DisplayModelId),
 			Aliases:        append([]string(nil), model.Aliases...),
 			Thinking:       model.ThinkingDetails != nil,
 			MaxMode:        model.MaxMode != nil && model.GetMaxMode(),

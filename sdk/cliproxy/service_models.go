@@ -296,6 +296,7 @@ func buildCursorCachedModels(auth *coreauth.Auth) []*ModelInfo {
 	if errJSON := json.Unmarshal(raw, &snapshot); errJSON != nil || len(snapshot) == 0 {
 		return nil
 	}
+	snapshot = cursorauth.NormalizeModelDetails(snapshot)
 	availableRoots := make(map[string]bool, len(snapshot))
 	levelsByRoot := make(map[string]map[string]bool)
 	for _, model := range snapshot {

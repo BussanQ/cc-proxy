@@ -55,6 +55,7 @@ func (h *Handler) cursorModelDefinitions() []*registry.ModelInfo {
 			if errUnmarshal := json.Unmarshal(raw, &snapshot); errUnmarshal != nil {
 				continue
 			}
+			snapshot = cursorauth.NormalizeModelDetails(snapshot)
 			for _, model := range snapshot {
 				id := strings.TrimSpace(model.ID)
 				if id == "" {

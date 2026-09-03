@@ -37,11 +37,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	translated, modelID, errPrepare := e.prepareCursorRequest(ctx, auth, req, opts, false)
+	translated, modelID, upstreamModelID, errPrepare := e.prepareCursorRequest(ctx, auth, req, opts, false)
 	if errPrepare != nil {
 		return resp, errPrepare
 	}
-	run, errRun := helps.BuildCursorRunPayload(translated, modelID)
+	run, errRun := helps.BuildCursorRunPayload(translated, upstreamModelID)
 	if errRun != nil {
 		return resp, cursorRequestError(errRun)
 	}
@@ -59,7 +59,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		if event.Err != nil {
 			return resp, event.Err
 		}
-		content.WriteString(event.Text)
+		content.WriteString(cursorPublicResponseText(event.Text))
 		reasoning.WriteString(event.Reasoning)
 		if event.ToolCallID != "" {
 			toolCalls = append(toolCalls, map[string]any{
@@ -114,11 +114,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	translated, modelID, errPrepare := e.prepareCursorRequest(ctx, auth, req, opts, true)
+	translated, modelID, upstreamModelID, errPrepare := e.prepareCursorRequest(ctx, auth, req, opts, true)
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-	run, errRun := helps.BuildCursorRunPayload(translated, modelID)
+	run, errRun := helps.BuildCursorRunPayload(translated, upstreamModelID)
 	if errRun != nil {
 		return nil, cursorRequestError(errRun)
 	}
@@ -156,6 +156,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return false
 			}
+			event.Text = cursorPublicResponseText(event.Text)
 			if event.Usage {
 				usageBody := cursorOpenAIStreamChunk(run.ConversationID, modelID, nil, nil, map[string]int{
 					"prompt_tokens":     event.PromptTokens,
@@ -215,9 +216,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	return &cliproxyexecutor.StreamResult{Headers: stream.Headers, Chunks: out}, nil
 }
 
-func (e *CursorExecutor) prepareCursorRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, string, error) {
+func (e *CursorExecutor) prepareCursorRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, string, string, error) {
 	if auth == nil || cursorAccessToken(auth) == "" {
-		return nil, "", &helps.CursorStatusError{Status: http.StatusUnauthorized, Message: "cursor executor: missing OAuth access token"}
+		return nil, "", "", &helps.CursorStatusError{Status: http.StatusUnauthorized, Message: "cursor executor: missing OAuth access token"}
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	from := opts.SourceFormat
@@ -230,7 +231,7 @@ func (e *CursorExecutor) prepareCursorRequest(ctx context.Context, auth *cliprox
 	var errThinking error
 	translated, errThinking = helps.ApplyThinkingWithSourcePayload(translated, req.Payload, originalPayload, req.Model, from.String(), "cursor", e.Identifier())
 	if errThinking != nil {
-		return nil, "", errThinking
+		return nil, "", "", errThinking
 	}
 	effort := strings.TrimSpace(gjson.GetBytes(translated, "cursor.reasoning_effort").String())
 	if updated, errDelete := sjson.DeleteBytes(translated, "cursor"); errDelete == nil {
@@ -238,13 +239,13 @@ func (e *CursorExecutor) prepareCursorRequest(ctx context.Context, auth *cliprox
 	}
 	modelID, errModel := resolveCursorModel(auth, baseModel, effort)
 	if errModel != nil {
-		return nil, "", errModel
+		return nil, "", "", errModel
 	}
 	updated, errSet := sjson.SetBytes(translated, "model", modelID)
 	if errSet != nil {
-		return nil, "", fmt.Errorf("cursor executor: set model: %w", errSet)
+		return nil, "", "", fmt.Errorf("cursor executor: set model: %w", errSet)
 	}
-	return updated, modelID, nil
+	return updated, modelID, cursorUpstreamModelID(auth, modelID), nil
 }
 
 func (e *CursorExecutor) CountTokens(ctx context.Context, _ *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -329,7 +330,7 @@ func cursorMetadataString(auth *cliproxyauth.Auth, key string) string {
 }
 
 func resolveCursorModel(auth *cliproxyauth.Auth, requested, effort string) (string, error) {
-	requested = strings.TrimSpace(requested)
+	requested = cursorauth.NormalizeModelID(requested)
 	models, okModels := decodeCursorModels(auth.Metadata[cursorauth.ModelCacheKey])
 	if !okModels || len(models) == 0 {
 		return "", &helps.CursorStatusError{Status: http.StatusServiceUnavailable, Message: "cursor executor: cached model catalog is unavailable"}
@@ -344,11 +345,7 @@ func resolveCursorModel(auth *cliproxyauth.Auth, requested, effort string) (stri
 		}
 		return "", &helps.CursorStatusError{Status: http.StatusBadRequest, Message: fmt.Sprintf("cursor executor: model %q is not available for this account", requested)}
 	}
-	root := trimCursorEffortSuffix(requested)
-	candidate := root
-	if effort != "none" {
-		candidate = root + "-" + effort
-	}
+	candidate := cursorModelWithEffort(requested, effort)
 	if _, ok := available[candidate]; ok {
 		return candidate, nil
 	}
@@ -358,6 +355,21 @@ func resolveCursorModel(auth *cliproxyauth.Auth, requested, effort string) (stri
 		}
 	}
 	return "", &helps.CursorStatusError{Status: http.StatusBadRequest, Message: fmt.Sprintf("cursor executor: reasoning effort %q has no discovered model variant for %q", effort, requested)}
+}
+
+func cursorModelWithEffort(model, effort string) string {
+	fast := strings.HasSuffix(strings.ToLower(model), "-fast")
+	if fast {
+		model = model[:len(model)-len("-fast")]
+	}
+	model = trimCursorEffortSuffix(model)
+	if effort != "none" {
+		model += "-" + effort
+	}
+	if fast {
+		model += "-fast"
+	}
+	return model
 }
 
 func trimCursorEffortSuffix(model string) string {
@@ -371,6 +383,7 @@ func trimCursorEffortSuffix(model string) string {
 
 func decodeCursorModels(value any) ([]cursorauth.ModelDetails, bool) {
 	if models, ok := value.([]cursorauth.ModelDetails); ok {
+		models = cursorauth.NormalizeModelDetails(models)
 		return models, len(models) > 0
 	}
 	raw, errMarshal := json.Marshal(value)
@@ -381,7 +394,28 @@ func decodeCursorModels(value any) ([]cursorauth.ModelDetails, bool) {
 	if errJSON := json.Unmarshal(raw, &models); errJSON != nil {
 		return nil, false
 	}
+	models = cursorauth.NormalizeModelDetails(models)
 	return models, len(models) > 0
+}
+
+func cursorUpstreamModelID(auth *cliproxyauth.Auth, modelID string) string {
+	if auth == nil || auth.Metadata == nil {
+		return modelID
+	}
+	models, okModels := decodeCursorModels(auth.Metadata[cursorauth.ModelCacheKey])
+	if !okModels {
+		return modelID
+	}
+	for _, model := range models {
+		if model.ID == modelID && strings.TrimSpace(model.UpstreamID) != "" {
+			return strings.TrimSpace(model.UpstreamID)
+		}
+	}
+	return modelID
+}
+
+func cursorPublicResponseText(text string) string {
+	return strings.ReplaceAll(text, `The model "cursor-`, `The model "`)
 }
 
 func cursorRequestError(err error) error {

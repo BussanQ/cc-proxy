@@ -57,7 +57,7 @@ func TestGetStaticModelDefinitionsCursorUsesOAuthSnapshot(t *testing.T) {
 	if len(response.Models) != 2 {
 		t.Fatalf("models = %+v, want 2 dynamic Cursor models", response.Models)
 	}
-	if response.Models[0].ID != "cursor-model-high" || response.Models[1].ID != "cursor-model-medium" {
+	if response.Models[0].ID != "model-high" || response.Models[1].ID != "model-medium" {
 		t.Fatalf("models = %+v, want sorted Cursor snapshot", response.Models)
 	}
 }

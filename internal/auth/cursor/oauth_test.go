@@ -90,8 +90,8 @@ func TestClientRefreshUsesNewAccessAsRefreshFallback(t *testing.T) {
 
 func TestClientDiscoverModels(t *testing.T) {
 	responseBody, errMarshal := proto.Marshal(&cursorproto.GetUsableModelsResponse{Models: []*cursorproto.ModelDetails{
-		{ModelId: "gpt-test", DisplayName: "GPT Test"},
-		{ModelId: "gpt-test-high", DisplayName: "GPT Test High", ThinkingDetails: &cursorproto.ThinkingDetails{}},
+		{ModelId: "cursor-gpt-test", DisplayModelId: "cursor-gpt-test", DisplayName: "GPT Test"},
+		{ModelId: "cursor-gpt-test-high", DisplayModelId: "cursor-gpt-test-high", DisplayName: "GPT Test High", ThinkingDetails: &cursorproto.ThinkingDetails{}},
 	}})
 	if errMarshal != nil {
 		t.Fatalf("marshal response: %v", errMarshal)
@@ -111,7 +111,7 @@ func TestClientDiscoverModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiscoverModels() error = %v", err)
 	}
-	if len(models) != 2 || models[1].ID != "gpt-test-high" || !models[1].Thinking {
+	if len(models) != 2 || models[0].ID != "gpt-test" || models[0].UpstreamID != "cursor-gpt-test" || models[0].DisplayModelID != "gpt-test" || models[1].ID != "gpt-test-high" || !models[1].Thinking {
 		t.Fatalf("unexpected models: %#v", models)
 	}
 }
