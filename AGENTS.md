@@ -21,7 +21,7 @@ Follow standard Go conventions and `gofmt`. Package names should be short and lo
 
 ## Testing Guidelines
 
-Use Go's `testing` package and table-driven tests where multiple cases share behavior. Add or update tests beside the changed package; use `test/` only for behavior spanning modules or provider pipelines. During development, run only the necessary package or named tests rather than the full suite. Verify that the affected command still compiles when changing runtime code.
+Use Go's `testing` package and table-driven tests where multiple cases share behavior. Add or update tests beside the changed package; use `test/` only for behavior spanning modules or provider pipelines. During development, run only the necessary package or named tests rather than the full suite. Verify that the affected command still compiles when changing runtime code. Avoid wall-clock `time.Sleep` in timing-sensitive unit tests; prefer controllable clocks, explicit timestamps, or deterministic synchronization.
 
 ## Commit & Pull Request Guidelines
 
