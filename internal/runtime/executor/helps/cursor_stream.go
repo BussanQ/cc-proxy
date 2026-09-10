@@ -1,7 +1,6 @@
 package helps
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -25,27 +24,8 @@ const (
 	cursorConnectEndStreamFlag  = byte(0x02)
 	cursorConnectCompressedFlag = byte(0x01)
 	cursorMaxFrameSize          = 64 << 20
+	cursorToolBatchIdle         = 250 * time.Millisecond
 )
-
-// CursorStatusError is an HTTP-like error returned by Cursor's Connect stream.
-type CursorStatusError struct {
-	Status  int
-	Message string
-}
-
-func (e *CursorStatusError) Error() string {
-	if e == nil {
-		return "cursor upstream error"
-	}
-	return e.Message
-}
-
-func (e *CursorStatusError) StatusCode() int {
-	if e == nil {
-		return 0
-	}
-	return e.Status
-}
 
 // CursorStreamEvent is one normalized event emitted by Cursor AgentService.Run.
 type CursorStreamEvent struct {
@@ -134,6 +114,10 @@ func OpenCursorStream(ctx context.Context, client *http.Client, accessToken stri
 		_ = response.Body.Close()
 		return nil, errInitial
 	}
+	responseHeaders := response.Header.Clone()
+	if cursorRequestID(responseHeaders) == "" {
+		responseHeaders.Set("X-Request-ID", request.Header.Get("X-Request-ID"))
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		writer.close()
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
@@ -144,11 +128,15 @@ func OpenCursorStream(ctx context.Context, client *http.Client, accessToken stri
 		if message == "" {
 			message = http.StatusText(response.StatusCode)
 		}
-		return nil, &CursorStatusError{Status: response.StatusCode, Message: "cursor stream: " + message}
+		err := &CursorStatusError{Status: response.StatusCode, Message: "cursor stream: " + message}
+		if cursorRequestErrorMessage(message) {
+			err.Status, err.RequestScoped = http.StatusBadRequest, true
+		}
+		return nil, attachCursorErrorHeaders(err, responseHeaders)
 	}
 
 	events := make(chan CursorStreamEvent)
-	go runCursorResponseLoop(ctx, response.Body, writer, run, events)
+	go runCursorResponseLoop(ctx, response.Body, writer, run, events, responseHeaders)
 	return &CursorStream{Headers: response.Header.Clone(), Events: events}, nil
 }
 
@@ -165,7 +153,7 @@ func applyCursorRunHeaders(request *http.Request, accessToken string) {
 	request.Header.Set("X-Request-ID", uuid.NewString())
 }
 
-func runCursorResponseLoop(ctx context.Context, body io.ReadCloser, writer *cursorRequestWriter, run *CursorRunPayload, events chan<- CursorStreamEvent) {
+func runCursorResponseLoop(ctx context.Context, body io.ReadCloser, writer *cursorRequestWriter, run *CursorRunPayload, events chan<- CursorStreamEvent, headers http.Header) {
 	defer close(events)
 	defer writer.close()
 	defer func() {
@@ -178,10 +166,55 @@ func runCursorResponseLoop(ctx context.Context, body io.ReadCloser, writer *curs
 	defer close(heartbeatDone)
 	go sendCursorHeartbeats(ctx, writer, heartbeatDone)
 
+	// Reading independently lets a quiet tool batch finish while Cursor waits for tool results.
+	type frameResult struct {
+		flags   byte
+		message []byte
+		err     error
+	}
+	frames := make(chan frameResult, 1)
+	readDone := make(chan struct{})
+	defer close(readDone)
+	go func() {
+		for {
+			flags, message, err := readCursorConnectFrame(body)
+			select {
+			case frames <- frameResult{flags, message, err}:
+			case <-readDone:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	var toolTimer *time.Timer
+	var toolDeadline <-chan time.Time
+	defer func() {
+		if toolTimer != nil {
+			toolTimer.Stop()
+		}
+	}()
+	seenTools := make(map[string]bool)
 	completionTokens := 0
 	totalTokens := 0
 	for {
-		flags, message, errFrame := readCursorConnectFrame(body)
+		var frame frameResult
+		select {
+		case <-ctx.Done():
+			return
+		case frame = <-frames:
+		case <-toolDeadline:
+			// Consume an already queued frame before closing the batch.
+			select {
+			case frame = <-frames:
+			default:
+				emitCursorUsage(ctx, events, totalTokens, completionTokens)
+				emitCursorEvent(ctx, events, CursorStreamEvent{Done: true})
+				return
+			}
+		}
+		flags, message, errFrame := frame.flags, frame.message, frame.err
 		if errFrame != nil {
 			if errFrame == io.EOF || ctx.Err() != nil {
 				emitCursorUsage(ctx, events, totalTokens, completionTokens)
@@ -193,13 +226,17 @@ func runCursorResponseLoop(ctx context.Context, body io.ReadCloser, writer *curs
 			emitCursorEvent(ctx, events, CursorStreamEvent{Err: errFrame})
 			return
 		}
+		if toolTimer != nil {
+			// Token/context updates between tool calls are still upstream activity.
+			toolTimer.Reset(cursorToolBatchIdle)
+		}
 		if flags&cursorConnectCompressedFlag != 0 {
 			emitCursorEvent(ctx, events, CursorStreamEvent{Err: &CursorStatusError{Status: http.StatusBadGateway, Message: "cursor stream: compressed Connect frames are unsupported"}})
 			return
 		}
 		if flags&cursorConnectEndStreamFlag != 0 {
 			if errEnd := parseCursorConnectEnd(message); errEnd != nil {
-				emitCursorEvent(ctx, events, CursorStreamEvent{Err: errEnd})
+				emitCursorEvent(ctx, events, CursorStreamEvent{Err: attachCursorErrorHeaders(errEnd, headers)})
 				return
 			}
 			emitCursorUsage(ctx, events, totalTokens, completionTokens)
@@ -246,10 +283,17 @@ func runCursorResponseLoop(ctx context.Context, body io.ReadCloser, writer *curs
 				return
 			}
 			if toolCall != nil {
+				if seenTools[toolCall.ToolCallID] {
+					continue
+				}
+				seenTools[toolCall.ToolCallID] = true
 				emitCursorEvent(ctx, events, *toolCall)
-				emitCursorUsage(ctx, events, totalTokens, completionTokens)
-				emitCursorEvent(ctx, events, CursorStreamEvent{Done: true})
-				return
+				if toolTimer == nil {
+					toolTimer = time.NewTimer(cursorToolBatchIdle)
+					toolDeadline = toolTimer.C
+				} else {
+					toolTimer.Reset(cursorToolBatchIdle)
+				}
 			}
 		}
 	}
@@ -287,55 +331,6 @@ func readCursorConnectFrame(reader io.Reader) (byte, []byte, error) {
 		return 0, nil, errRead
 	}
 	return header[0], payload, nil
-}
-
-func parseCursorConnectEnd(payload []byte) error {
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return nil
-	}
-	var envelope struct {
-		Error *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if errJSON := json.Unmarshal(payload, &envelope); errJSON != nil || envelope.Error == nil {
-		return nil
-	}
-	message := strings.TrimSpace(envelope.Error.Message)
-	if message == "" {
-		message = "Cursor upstream error"
-	}
-	status := http.StatusBadGateway
-	switch strings.ToLower(strings.TrimSpace(envelope.Error.Code)) {
-	case "unauthenticated":
-		status = http.StatusUnauthorized
-	case "resource_exhausted":
-		if cursorContextError(message) {
-			status = http.StatusBadRequest
-		} else {
-			status = http.StatusTooManyRequests
-		}
-	case "invalid_argument":
-		status = http.StatusBadRequest
-	case "unavailable":
-		status = http.StatusServiceUnavailable
-	case "deadline_exceeded":
-		status = http.StatusGatewayTimeout
-	case "internal":
-		status = http.StatusBadGateway
-	}
-	return &CursorStatusError{Status: status, Message: "cursor stream: " + message}
-}
-
-func cursorContextError(message string) bool {
-	lower := strings.ToLower(message)
-	for _, marker := range []string{"context", "token", "length", "overflow", "too long", "too large"} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 func respondCursorKV(writer *cursorRequestWriter, blobs map[string][]byte, message *cursorproto.KvServerMessage) error {
@@ -397,6 +392,12 @@ func respondCursorExec(writer *cursorRequestWriter, tools []*cursorproto.McpTool
 		name := strings.TrimSpace(item.McpArgs.ToolName)
 		if name == "" {
 			name = strings.TrimSpace(item.McpArgs.Name)
+			for _, tool := range tools {
+				if tool != nil && tool.Name == name && tool.ToolName != "" {
+					name = tool.ToolName
+					break
+				}
+			}
 		}
 		return &CursorStreamEvent{ToolCallID: callID, ToolName: name, ToolArguments: string(encoded)}, nil
 	case *cursorproto.ExecServerMessage_ReadArgs:

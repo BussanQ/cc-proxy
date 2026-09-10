@@ -339,11 +339,23 @@ func resolveCursorModel(auth *cliproxyauth.Auth, requested, effort string) (stri
 	for _, model := range models {
 		available[model.ID] = struct{}{}
 	}
+	// Canonical IDs take precedence over aliases, including aliases of other models.
+	if _, canonical := available[requested]; !canonical {
+	resolveAlias:
+		for _, model := range models {
+			for _, alias := range model.Aliases {
+				if alias == requested {
+					requested = model.ID
+					break resolveAlias
+				}
+			}
+		}
+	}
 	if effort == "" || effort == "auto" {
 		if _, ok := available[requested]; ok {
 			return requested, nil
 		}
-		return "", &helps.CursorStatusError{Status: http.StatusBadRequest, Message: fmt.Sprintf("cursor executor: model %q is not available for this account", requested)}
+		return "", &helps.CursorStatusError{Status: http.StatusBadRequest, RequestScoped: true, Message: fmt.Sprintf("cursor executor: model %q is not available for this account", requested)}
 	}
 	candidate := cursorModelWithEffort(requested, effort)
 	if _, ok := available[candidate]; ok {
@@ -354,7 +366,7 @@ func resolveCursorModel(auth *cliproxyauth.Auth, requested, effort string) (stri
 			return requested, nil
 		}
 	}
-	return "", &helps.CursorStatusError{Status: http.StatusBadRequest, Message: fmt.Sprintf("cursor executor: reasoning effort %q has no discovered model variant for %q", effort, requested)}
+	return "", &helps.CursorStatusError{Status: http.StatusBadRequest, RequestScoped: true, Message: fmt.Sprintf("cursor executor: reasoning effort %q has no discovered model variant for %q", effort, requested)}
 }
 
 func cursorModelWithEffort(model, effort string) string {

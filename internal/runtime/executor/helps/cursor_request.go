@@ -487,7 +487,7 @@ func buildCursorMCPTools(tools []cursorOpenAITool) ([]*cursorproto.McpToolDefini
 			return nil, fmt.Errorf("cursor request: marshal schema for tool %s: %w", name, errMarshal)
 		}
 		result = append(result, &cursorproto.McpToolDefinition{
-			Name:               name,
+			Name:               cursorMCPToolName(name),
 			Description:        tool.Function.Description,
 			InputSchema:        encoded,
 			ProviderIdentifier: cursorMCPProvider,
@@ -495,6 +495,17 @@ func buildCursorMCPTools(tools []cursorOpenAITool) ([]*cursorproto.McpToolDefini
 		})
 	}
 	return result, nil
+}
+
+// Namespace client tools to keep their names distinct from Cursor's native tools.
+func cursorMCPToolName(name string) string {
+	qualified := "mcp__" + cursorMCPProvider + "__" + name
+	const maxLength = 64
+	if len(qualified) <= maxLength {
+		return qualified
+	}
+	digest := sha256.Sum256([]byte(name))
+	return qualified[:maxLength-17] + "_" + hex.EncodeToString(digest[:8])
 }
 
 func buildCursorUserMessage(text string, images []cursorImage, selectedContextBlob []byte) *cursorproto.UserMessage {
@@ -569,7 +580,7 @@ func encodeCursorTurnStep(step cursorTurnStep) ([]byte, error) {
 			args[key] = encoded
 		}
 		mcpCall := &cursorproto.McpToolCall{Args: &cursorproto.McpArgs{
-			Name:               step.ToolName,
+			Name:               cursorMCPToolName(step.ToolName),
 			Args:               args,
 			ToolCallId:         step.ToolCallID,
 			ProviderIdentifier: cursorMCPProvider,

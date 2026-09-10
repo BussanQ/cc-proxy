@@ -158,8 +158,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		}
 		models = applyExcludedModels(models, excluded)
 	case "cursor":
-		models = buildCursorCachedModels(a)
-		models = applyExcludedModels(models, excluded)
+		models = buildCursorCachedModels(a, excluded...)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -284,7 +283,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	GlobalModelRegistry().UnregisterClient(a.ID)
 }
 
-func buildCursorCachedModels(auth *coreauth.Auth) []*ModelInfo {
+func buildCursorCachedModels(auth *coreauth.Auth, excluded ...string) []*ModelInfo {
 	if auth == nil || auth.Metadata == nil {
 		return nil
 	}
@@ -355,7 +354,32 @@ func buildCursorCachedModels(auth *coreauth.Auth) []*ModelInfo {
 		}
 		models = append(models, info)
 	}
-	return models
+	// Excluding a canonical model must also exclude its discovered aliases.
+	models = applyExcludedModels(models, excluded)
+	byID := make(map[string]*ModelInfo, len(models))
+	seen := make(map[string]bool, len(snapshot))
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	for _, model := range snapshot {
+		seen[model.ID] = true
+	}
+	for _, model := range snapshot {
+		info := byID[model.ID]
+		for _, alias := range model.Aliases {
+			if seen[alias] {
+				continue
+			}
+			seen[alias] = true
+			if info == nil {
+				continue
+			}
+			clone := *info
+			clone.ID = alias
+			models = append(models, &clone)
+		}
+	}
+	return applyExcludedModels(models, excluded)
 }
 
 func cursorModelRootAndLevel(id string) (string, string) {

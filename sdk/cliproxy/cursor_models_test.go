@@ -30,3 +30,38 @@ func TestBuildCursorCachedModelsThinkingVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildCursorCachedModelsAliasesAndExclusions(t *testing.T) {
+	auth := &coreauth.Auth{Metadata: map[string]any{cursorauth.ModelCacheKey: []cursorauth.ModelDetails{
+		{ID: "gemini-test-high", Aliases: []string{"gemini-test", "latest", "canonical"}},
+		{ID: "gemini-test-low", Aliases: []string{"latest", "low-alias"}},
+		{ID: "canonical"},
+	}}}
+	for _, tc := range []struct {
+		name           string
+		excluded, want []string
+	}{
+		{"all", nil, []string{"gemini-test-high", "gemini-test-low", "canonical", "gemini-test", "latest", "low-alias"}},
+		{"exclude canonical", []string{"gemini-test-high"}, []string{"gemini-test-low", "canonical", "low-alias"}},
+		{"exclude alias", []string{"latest"}, []string{"gemini-test-high", "gemini-test-low", "canonical", "gemini-test", "low-alias"}},
+		{"wildcard", []string{"gemini-*"}, []string{"canonical"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			models := buildCursorCachedModels(auth, tc.excluded...)
+			if len(models) != len(tc.want) {
+				t.Fatalf("got %d models want %v", len(models), tc.want)
+			}
+			for i, m := range models {
+				if m.ID != tc.want[i] {
+					t.Fatalf("model %d=%q want %q", i, m.ID, tc.want[i])
+				}
+			}
+			if tc.name == "all" {
+				alias := models[3]
+				if alias.Thinking == nil || alias.ContextLength != models[0].ContextLength || len(alias.Thinking.Levels) != 2 {
+					t.Fatalf("alias capabilities lost: %+v", alias)
+				}
+			}
+		})
+	}
+}

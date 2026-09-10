@@ -11,7 +11,61 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps/cursorproto"
 	claudetranslator "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/claude"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 )
+
+func TestCursorToolNamesStayConsistentAcrossDefinitionsAndHistory(t *testing.T) {
+	names := []string{"Read", "Write", "mcp__cliproxy__Read", strings.Repeat("a", 63) + "x", strings.Repeat("a", 63) + "y"}
+	seen := make(map[string]bool)
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+				"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+					"name": name, "parameters": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}},
+				}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := BuildCursorRunPayload(raw, "gemini-3.8-flash-high")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var message cursorproto.AgentClientMessage
+			if err := proto.Unmarshal(run.Message, &message); err != nil {
+				t.Fatal(err)
+			}
+			tool := message.GetRunRequest().GetMcpTools().GetMcpTools()[0]
+			if !strings.HasPrefix(tool.Name, "mcp__cliproxy__") || len(tool.Name) > 64 || seen[tool.Name] {
+				t.Fatalf("invalid or duplicate upstream name %q", tool.Name)
+			}
+			seen[tool.Name] = true
+			if tool.ToolName != name || tool.ProviderIdentifier != cursorMCPProvider || !proto.Equal(tool, run.Tools[0]) {
+				t.Fatalf("client identity or request-context tool differs: %v", tool)
+			}
+			var schema structpb.Value
+			if err := proto.Unmarshal(tool.InputSchema, &schema); err != nil {
+				t.Fatal(err)
+			}
+			if got := schema.GetStructValue().GetFields()["properties"].GetStructValue().GetFields()["path"].GetStructValue().GetFields()["type"].GetStringValue(); got != "string" {
+				t.Fatalf("schema was changed: %v", &schema)
+			}
+			step, err := encodeCursorTurnStep(cursorTurnStep{Kind: "tool", ToolName: name, ToolCallID: "call_1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var history cursorproto.ConversationStep
+			if err := proto.Unmarshal(step, &history); err != nil {
+				t.Fatal(err)
+			}
+			args := history.GetToolCall().GetMcpToolCall().GetArgs()
+			if args.Name != tool.Name || args.ToolName != name || args.ToolCallId != "call_1" {
+				t.Fatalf("historical tool identity differs: %v", args)
+			}
+		})
+	}
+}
 
 func TestBuildCursorRunPayloadWithImageAndTools(t *testing.T) {
 	image := base64.StdEncoding.EncodeToString([]byte("image"))

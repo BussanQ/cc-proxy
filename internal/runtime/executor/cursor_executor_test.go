@@ -55,3 +55,30 @@ func TestCursorPublicResponseTextRemovesCatalogPrefix(t *testing.T) {
 		t.Fatalf("cursorPublicResponseText() = %q, want %q", got, want)
 	}
 }
+
+func TestResolveCursorModelAliases(t *testing.T) {
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{cursorauth.ModelCacheKey: []cursorauth.ModelDetails{
+		{ID: "gemini-test-high", Aliases: []string{"gemini-test", "latest", "canonical"}},
+		{ID: "gemini-test-low", Aliases: []string{"latest"}},
+		{ID: "canonical"},
+	}}}
+	for _, tc := range []struct{ requested, effort, want string }{
+		{"gemini-test", "", "gemini-test-high"},
+		{"cursor-gemini-test", "auto", "gemini-test-high"},
+		{"gemini-test", "low", "gemini-test-low"},
+		{"latest", "", "gemini-test-high"},
+		{"canonical", "", "canonical"},
+	} {
+		got, err := resolveCursorModel(auth, tc.requested, tc.effort)
+		if err != nil || got != tc.want {
+			t.Fatalf("resolve(%q,%q)=%q,%v want %q", tc.requested, tc.effort, got, err, tc.want)
+		}
+	}
+	for _, tc := range []struct{ model, effort string }{{"missing", ""}, {"gemini-test", "max"}} {
+		_, err := resolveCursorModel(auth, tc.model, tc.effort)
+		scoped, ok := err.(interface{ IsRequestScoped() bool })
+		if !ok || !scoped.IsRequestScoped() {
+			t.Fatalf("invalid model/effort must be request-scoped: %v", err)
+		}
+	}
+}
