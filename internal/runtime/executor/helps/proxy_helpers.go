@@ -12,6 +12,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var proxyTransports = NewTransportCache[string](DefaultTransportCacheCapacity)
+
+const upstreamMaxIdleConnsPerHost = 100
+
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
@@ -54,14 +58,16 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+	if ctx != nil {
+		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+			httpClient.Transport = rt
+		}
 	}
 
 	return httpClient
 }
 
-// buildProxyTransport creates an HTTP transport configured for the given proxy URL.
+// buildProxyTransport shares a connection pool for each normalized proxy setting.
 // It supports SOCKS5, HTTP, and HTTPS proxy protocols.
 //
 // Parameters:
@@ -70,7 +76,33 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 // Returns:
 //   - *http.Transport: A configured transport, or nil if the proxy URL is invalid
 func buildProxyTransport(proxyURL string) *http.Transport {
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	setting, errParse := proxyutil.Parse(proxyURL)
+	if errParse != nil {
+		log.Errorf("%v", errParse)
+		return nil
+	}
+	if setting.Mode == proxyutil.ModeInherit {
+		return nil
+	}
+	key := setting.Raw
+	if setting.Mode == proxyutil.ModeDirect {
+		key = "direct"
+	}
+	transport, errBuild := proxyTransports.Get(key, func() (*http.Transport, error) {
+		transport, _, err := proxyutil.BuildHTTPTransport(key)
+		if err != nil {
+			return nil, err
+		}
+		// Keep concurrent HTTP/1.1 requests reusable without overriding an
+		// explicitly disabled or larger pool inherited from DefaultTransport.
+		if transport.MaxIdleConnsPerHost >= 0 && transport.MaxIdleConnsPerHost < upstreamMaxIdleConnsPerHost {
+			transport.MaxIdleConnsPerHost = upstreamMaxIdleConnsPerHost
+		}
+		if transport.MaxIdleConns > 0 && transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
+			transport.MaxIdleConns = transport.MaxIdleConnsPerHost
+		}
+		return transport, nil
+	})
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 		return nil

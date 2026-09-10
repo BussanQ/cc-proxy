@@ -1,9 +1,11 @@
 package helps
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
+	standardtls "crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -11,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strconv"
@@ -27,21 +30,6 @@ type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
-}
-
-type trackedReadCloser struct {
-	io.Reader
-	closeCount int
-	closeErr   error
-	onClose    func()
-}
-
-func (r *trackedReadCloser) Close() error {
-	r.closeCount++
-	if r.onClose != nil {
-		r.onClose()
-	}
-	return r.closeErr
 }
 
 type contextDialerFunc func(context.Context, string, string) (net.Conn, error)
@@ -62,56 +50,6 @@ type trackedNetConn struct {
 func (c *trackedNetConn) Close() error {
 	c.closeCount.Add(1)
 	return c.Conn.Close()
-}
-
-func TestCloseConnectionBodyClosesConnectionBeforeBodyOnce(t *testing.T) {
-	bodyErr := errors.New("body close failed")
-	connectionErr := errors.New("connection close failed")
-	var closeOrder []string
-	body := &trackedReadCloser{
-		Reader:   strings.NewReader("response"),
-		closeErr: bodyErr,
-		onClose: func() {
-			closeOrder = append(closeOrder, "body")
-		},
-	}
-	connectionCloseCount := 0
-	wrapped := &closeConnectionBody{
-		ReadCloser: body,
-		closeConnection: func() error {
-			connectionCloseCount++
-			closeOrder = append(closeOrder, "connection")
-			return connectionErr
-		},
-	}
-
-	payload, errRead := io.ReadAll(wrapped)
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	if got, want := string(payload), "response"; got != want {
-		t.Fatalf("response body = %q, want %q", got, want)
-	}
-
-	errClose := wrapped.Close()
-	if !errors.Is(errClose, bodyErr) {
-		t.Fatalf("close error = %v, want body close error", errClose)
-	}
-	if !errors.Is(errClose, connectionErr) {
-		t.Fatalf("close error = %v, want connection close error", errClose)
-	}
-	if errCloseAgain := wrapped.Close(); errCloseAgain != errClose {
-		t.Fatalf("second close error = %v, want %v", errCloseAgain, errClose)
-	}
-	if body.closeCount != 1 {
-		t.Fatalf("body close count = %d, want 1", body.closeCount)
-	}
-	if connectionCloseCount != 1 {
-		t.Fatalf("connection close count = %d, want 1", connectionCloseCount)
-	}
-	if want := []string{"connection", "body"}; !reflect.DeepEqual(closeOrder, want) {
-		t.Fatalf("close order = %v, want %v", closeOrder, want)
-	}
 }
 
 func TestUtlsRoundTripperDialUsesRequestContext(t *testing.T) {
@@ -171,7 +109,7 @@ func TestUtlsRoundTripperHandshakeUsesRequestContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	connectionDone := make(chan error, 1)
 	go func() {
-		h2Conn, errConnect := roundTripper.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
+		h2Conn, errConnect := roundTripper.dialTLSConnection(ctx, "chatgpt.com:443", &standardtls.Config{ServerName: "chatgpt.com"})
 		if h2Conn != nil {
 			errConnect = errors.Join(errConnect, h2Conn.Close())
 		}
@@ -187,7 +125,7 @@ func TestUtlsRoundTripperHandshakeUsesRequestContext(t *testing.T) {
 	select {
 	case errConnect := <-connectionDone:
 		if !errors.Is(errConnect, context.Canceled) {
-			t.Fatalf("createConnection error = %v, want context canceled", errConnect)
+			t.Fatalf("dialTLSConnection error = %v, want context canceled", errConnect)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("TLS handshake did not stop after context cancellation")
@@ -638,4 +576,119 @@ func summarizeClaudeCodeClientHelloSpec(t *testing.T, spec *tls.ClientHelloSpec)
 	digest := md5.Sum([]byte(summary.JA3)) // #nosec G401 -- JA3 requires MD5.
 	summary.JA3MD5 = hex.EncodeToString(digest[:])
 	return summary
+}
+
+func TestUtlsClientsReuseHTTP2Connections(t *testing.T) {
+	finishStreams := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 {
+			t.Errorf("protocol = %s, want HTTP/2", r.Proto)
+		}
+		_, _ = fmt.Fprintln(w, r.RemoteAddr)
+		if r.URL.Path == "/stream" {
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-finishStreams:
+				_, _ = io.WriteString(w, "done\n")
+			}
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	auth := &cliproxyauth.Auth{ProxyURL: server.URL}
+	newClient := func() *http.Client { return NewUtlsHTTPClient(t.Context(), nil, auth, 5*time.Second) }
+	first := newClient()
+	transport := first.Transport.(*fallbackRoundTripper).chrome.(*utlsRoundTripper)
+	if newClient().Transport.(*fallbackRoundTripper).chrome != transport {
+		t.Fatal("new client did not reuse the Chrome transport")
+	}
+	// Use a trusted local HTTP/2 server to exercise the production pool without
+	// requiring public network access or weakening production TLS verification.
+	tlsConfig := server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	tlsConfig.NextProtos = []string{"h2"}
+	transport.http2Transport().DialTLSContext = func(ctx context.Context, network, _ string, _ *standardtls.Config) (net.Conn, error) {
+		dialer := &standardtls.Dialer{Config: tlsConfig}
+		return dialer.DialContext(ctx, network, server.Listener.Addr().String())
+	}
+	defer first.CloseIdleConnections()
+
+	request := func(path string) (*http.Response, string) {
+		t.Helper()
+		resp, err := newClient().Get("https://chatgpt.com" + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		line, err := bufio.NewReader(resp.Body).ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, line
+	}
+	var connection string
+	for i := 0; i < 3; i++ {
+		resp, addr := request("/")
+		_ = resp.Body.Close()
+		if i == 0 {
+			connection = addr
+		} else if addr != connection {
+			t.Fatalf("request %d used %q, want %q", i, addr, connection)
+		}
+	}
+
+	// Two active streams must share the connection. Closing one response and
+	// cleaning idle connections must leave the other stream and pool usable.
+	streamA, addrA := request("/stream")
+	streamB, addrB := request("/stream")
+	if addrA != connection || addrB != connection {
+		t.Fatalf("streams used %q and %q, want %q", addrA, addrB, connection)
+	}
+	_ = streamA.Body.Close()
+	first.CloseIdleConnections()
+	resp, addr := request("/")
+	_ = resp.Body.Close()
+	if addr != connection {
+		t.Fatalf("active connection replaced: %q, want %q", addr, connection)
+	}
+	close(finishStreams)
+	body, err := io.ReadAll(streamB.Body)
+	if err != nil || string(body) != "done\n" {
+		t.Fatalf("surviving stream body = %q, error = %v", body, err)
+	}
+	_ = streamB.Body.Close()
+
+	first.CloseIdleConnections()
+	resp, addr = request("/")
+	_ = resp.Body.Close()
+	if addr == connection {
+		t.Fatal("CloseIdleConnections did not close the idle HTTP/2 connection")
+	}
+}
+
+func TestCachedUtlsRoundTripperBoundsProxyCardinality(t *testing.T) {
+	const proxyURL = "http://127.0.0.1:31000"
+	first := cachedUtlsRoundTripper(proxyURL)
+	for i := 1; i <= DefaultTransportCacheCapacity; i++ {
+		cachedUtlsRoundTripper(fmt.Sprintf("http://127.0.0.1:%d", 31000+i))
+	}
+	if chromeRoundTripperCache.Len() > DefaultTransportCacheCapacity {
+		t.Fatal("Chrome transport cache exceeded capacity")
+	}
+	if cachedUtlsRoundTripper(proxyURL) == first {
+		t.Fatal("least recently used Chrome transport was not evicted")
+	}
+}
+
+func TestClaudeCodeTransportPoolLimits(t *testing.T) {
+	transport := newClaudeCodeRoundTripper("").(*http.Transport)
+	defer transport.CloseIdleConnections()
+	if transport.MaxIdleConnsPerHost < upstreamMaxIdleConnsPerHost || transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
+		t.Fatalf("insufficient idle pool: total %d, per host %d", transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatal("idle connections never expire")
+	}
 }
